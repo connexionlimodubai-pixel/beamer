@@ -88,6 +88,31 @@ class InputScale:
         return dy * self.scroll * sign, dx * self.scroll * sign
 
 
+def _unplug_pads(injector, link) -> None:
+    """Unplug every virtual pad on `link` (docs/GAMEPAD.md).
+
+    A link lost mid-trigger must not leave the PC holding it, which is the pad's version of the
+    held-key rule in section 4.
+
+    Takes the injector rather than hanging off the responder so that `_release_locked`, which
+    calls it, still asks its responder for nothing but `_injector_module`. `pads` is read
+    defensively for the same reason: a link stood in for by a test carries only what that test
+    needs, and a stand-in with no real record of pads has none to unplug. The type is checked
+    rather than the truth of it, because a Mock answers every attribute with something truthy."""
+    pads = getattr(link, "pads", None)
+    if not isinstance(pads, dict) or not pads:
+        return
+    detach = getattr(injector, "gamepad_detach", None)
+    for pad in sorted(pads):
+        if detach is None:
+            continue
+        try:
+            detach(pad)
+        except Exception:
+            LOGGER.exception("Could not unplug virtual pad %s for %s", pad, getattr(link, "name", "a peer"))
+    pads.clear()
+
+
 def _close_socket(sock: Optional[socket.socket]) -> None:
     if sock is None:
         return
@@ -1226,13 +1251,6 @@ class LinkResponder:
         report(pad, read["buttons"], read["lt"], read["rt"], read["lx"], read["ly"], read["rx"], read["ry"])
         link.timing.add("pad_inject", time.monotonic() - inject_at)
 
-    def _release_pads_locked(self, link: _Link) -> None:
-        """Unplug every virtual pad this link has. A link lost mid-trigger must not leave the PC
-        holding it, which is the pad's version of the held-key rule in section 4."""
-        for pad in sorted(link.pads):
-            self._pad_detach_locked(link, pad)
-        link.pads.clear()
-
     def _apply_motion_path_locked(self, link, read, after):
         desktop = self._desktop_module()
         pointer, monitors = desktop.cursor_position(), desktop.monitors()
@@ -1502,8 +1520,11 @@ class LinkResponder:
 
         The virtual pads go too: `_serve` ends the ownership when a link closes, so unplugging
         them here covers a let-go, a take by another machine and a dropped link alike."""
-        self._release_pads_locked(link)
         injector = self._injector_module()
+        # Through a module-level helper taking the injector, not a method on self: this function
+        # asks its responder for nothing but `_injector_module`, and tests stand a
+        # SimpleNamespace in for one.
+        _unplug_pads(injector, link)
         for (kind, name), us in reversed(list(link.held.items())):
             try:
                 if kind == "key":
