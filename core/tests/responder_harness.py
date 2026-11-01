@@ -78,6 +78,9 @@ class FakeInjector:
         self.calls = []
         self.keys_us = []
         self._lock = threading.Lock()
+        # Virtual pads (docs/GAMEPAD.md): which are plugged in, and whether plugging in works.
+        self.pads = {}
+        self.pad_attach_ok = True
 
     def _add(self, *call):
         with self._lock:
@@ -105,6 +108,29 @@ class FakeInjector:
 
     def release_all(self):
         self._add("release_all")
+
+    def gamepad_available(self):
+        return True
+
+    def gamepad_attach(self, pad, kind="x360"):
+        self._add("pad_attach", pad, kind)
+        if not self.pad_attach_ok:
+            return False
+        with self._lock:
+            self.pads[pad] = kind
+        return True
+
+    def gamepad_detach(self, pad):
+        self._add("pad_detach", pad)
+        with self._lock:
+            self.pads.pop(pad, None)
+
+    def gamepad_report(self, pad, buttons, lt, rt, lx, ly, rx, ry):
+        self._add("pad", pad, buttons, lt, rt, lx, ly, rx, ry)
+
+    def plugged(self):
+        with self._lock:
+            return dict(self.pads)
 
     def seen(self):
         with self._lock:

@@ -26,7 +26,8 @@ class IdleTakeover(unittest.TestCase):
         self.take(self.b, 1)
 
     def make_link(self, peer):
-        link = mock.Mock(peer_id=peer, own_id=HERE, route=0, allow_drive=True, held={})
+        # `held` and `pads` are given real containers because _release_locked walks both.
+        link = mock.Mock(peer_id=peer, own_id=HERE, route=0, allow_drive=True, held={}, pads={})
         link.closed.is_set.return_value = False
         return link
 

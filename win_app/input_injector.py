@@ -783,3 +783,63 @@ def inject_gesture(name: str, swipe=None) -> None:
         inject_key(key, down=True)
     for key in reversed(chord):
         inject_key(key, down=False)
+
+
+# --- Virtual pads (docs/GAMEPAD.md) ---
+#
+# The receiver reaches these by getattr, so a platform without them simply never offers the
+# `gamepad` capability. They delegate to win_app/vigem.py, which is where the ViGEmBus driver and
+# ctypes live; this module stays about SendInput.
+#
+# Imported lazily: loading ViGEmClient.dll costs nothing until a pad is actually asked for, and a
+# machine with no driver should not pay for one at start-up.
+
+
+def _vigem():
+    global _VIGEM
+    if _VIGEM is None:
+        import vigem
+
+        _VIGEM = vigem
+    return _VIGEM
+
+
+_VIGEM = None
+
+
+def gamepad_available() -> bool:
+    """Whether this machine can plug a virtual pad in. What decides the `gamepad` capability."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        return _vigem().available()
+    except Exception:                                       # noqa: BLE001 - absence is not a crash
+        LOGGER.info("Virtual pads are unavailable", exc_info=True)
+        return False
+
+
+def gamepad_unavailable_reason():
+    if not sys.platform.startswith("win"):
+        return "virtual pads need Windows"
+    try:
+        return _vigem().unavailable_reason()
+    except Exception as exc:                                # noqa: BLE001
+        return str(exc)
+
+
+def gamepad_attach(pad: int, kind: str = "x360") -> bool:
+    return _vigem().attach(pad, kind)
+
+
+def gamepad_detach(pad: int) -> None:
+    _vigem().detach(pad)
+
+
+def gamepad_report(pad: int, buttons: int, lt: int, rt: int, lx: int, ly: int, rx: int, ry: int) -> None:
+    _vigem().report(pad, buttons, lt, rt, lx, ly, rx, ry)
+
+
+def gamepad_shutdown() -> None:
+    """Called when the app quits, so no phantom controller is left in the device list."""
+    if _VIGEM is not None:
+        _VIGEM.shutdown()

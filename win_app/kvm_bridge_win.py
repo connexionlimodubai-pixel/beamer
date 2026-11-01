@@ -779,6 +779,8 @@ class WindowsApplication(QWidget):
         # first peer, so it cannot wait for the receiver to be listening. Without a readable
         # settings file there is no machine id to pair under, and so no service.
         self._settings_port, self._kept_hide = self._read_kept()
+        # Whether virtual pads are available, worked out on the first handshake (_gamepad_offered).
+        self._gamepad_cap = None
         self.pairing = self._make_pairing()
         self.sender.machines = self.pairing.machines if self.pairing is not None else (lambda: [])
 
@@ -2023,10 +2025,33 @@ class WindowsApplication(QWidget):
             "platform": OWN_PLATFORM,
             "app": VERSION[:32] if VERSION.isascii() and VERSION.isprintable() else "dev",
             # A swipe has no shortcut every Linux desktop shares, so Linux does not offer gestures.
-            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path")
-                     if not (cap == "gestures" and OWN_PLATFORM == "linux")],
+            # `gamepad` is offered only where a virtual pad can actually be plugged in: Windows
+            # with the ViGEmBus driver present. A peer must not be told it can send pad reports
+            # here and then have them silently dropped.
+            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path", "gamepad")
+                     if not (cap == "gestures" and OWN_PLATFORM == "linux")
+                     and not (cap == "gamepad" and not self._gamepad_offered())],
             "port": self._settings_port,
         }
+
+    def _gamepad_offered(self) -> bool:
+        """Whether a virtual pad can be plugged in, asked once and remembered.
+
+        Asked lazily rather than at start-up: the answer means loading ViGEmClient.dll and
+        reaching the driver, which a machine that never receives a pad should not pay for. Cached
+        because `_identity` is read on every handshake, and a driver does not come and go."""
+        if self._gamepad_cap is None:
+            offered = getattr(platform_parts.injector, "gamepad_available", None)
+            try:
+                self._gamepad_cap = bool(offered and offered())
+            except Exception:
+                LOGGER.exception("Could not tell whether virtual pads are available")
+                self._gamepad_cap = False
+            if not self._gamepad_cap:
+                reason = getattr(platform_parts.injector, "gamepad_unavailable_reason", None)
+                LOGGER.info("The gamepad capability is not offered: %s",
+                            (reason and reason()) or "no virtual pad support")
+        return self._gamepad_cap
 
     def _zones(self) -> list:
         try:
@@ -5536,6 +5561,14 @@ class WindowsApplication(QWidget):
         stop_injector = getattr(platform_parts.injector, "stop", None)
         if stop_injector is not None:
             stop_injector()
+        # After server.stop(), so every link has ended and released its pads already; this is the
+        # backstop that closes the bus handle so no phantom controller is left behind.
+        stop_pads = getattr(platform_parts.injector, "gamepad_shutdown", None)
+        if stop_pads is not None:
+            try:
+                stop_pads()
+            except Exception:
+                LOGGER.exception("Could not unplug the virtual pads on the way out")
         overlay = getattr(self, "_cursor_overlay", None)
         if overlay is not None:
             overlay.close()

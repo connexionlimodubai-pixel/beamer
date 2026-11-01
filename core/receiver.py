@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Callable, Optional, Tuple
 
 from . import return_edge as crossing
+from . import gamepad
 from . import peerlist
 from . import protocol
 from .i18n import tr, trc
@@ -390,6 +391,7 @@ class _Link:
         self.allow_drive = allow_drive
         self.route = 0              # the last route accepted on this link
         self.held = {}              # ("key" or "button", name): `us`, what the owner holds down here
+        self.pads = {}              # pad index: kind, the virtual pads plugged in for this link
         self.closed = threading.Event()
         self.cond = threading.Condition()
         self.outbox = collections.deque()
@@ -1046,6 +1048,8 @@ class LinkResponder:
         try:
             if kind in protocol.INPUT_TYPES:
                 self._on_input(link, message)
+            elif kind in gamepad.PAD_TYPES:
+                self._on_pad(link, message)
             elif kind == protocol.MSG_FOCUS:
                 self._on_focus(link, message)
             elif kind == protocol.MSG_CLIPBOARD:
@@ -1120,6 +1124,114 @@ class LinkResponder:
         callbacks_at = time.monotonic()
         self._run(after)
         link.timing.add("input_callbacks", time.monotonic() - callbacks_at)
+
+    # The pad (docs/GAMEPAD.md). Not part of upstream wire version 6.
+
+    def _on_pad(self, link: _Link, message) -> None:
+        """A `gamepad_attach`, `gamepad_detach` or `gamepad` from the owner.
+
+        Held under the same lock as keyboard and mouse input, for the same reason: an ownership
+        ending on another thread must not be able to slip between the owner check and the report
+        reaching the virtual pad, or a stick could be left pushed over after the owner has gone.
+
+        A peer that sends these without the `gamepad` capability having been offered is ignored,
+        as section 2 says of any message a capability does not cover."""
+        if gamepad.CAP_GAMEPAD not in link.own_caps:
+            return
+        kind = message.get("type")
+
+        if kind == gamepad.MSG_GAMEPAD:
+            read = gamepad.read_report(message)
+            if read is None:
+                return
+            try:
+                with self._lock:
+                    if self._owner is link and not self._unlocking.is_set():
+                        self._pad_report_locked(link, read)
+            except Exception:
+                LOGGER.exception("A pad report from %s could not be injected", link.name)
+                self._input_error_status(link)
+            finally:
+                # Acknowledged whether or not it was injected, exactly as input is: an initiator
+                # drops its link when its oldest unacknowledged message ages out, and a report
+                # dropped because this machine is not being driven is not a dead link.
+                link.dealt_with(read["seq"])
+            return
+
+        if kind == gamepad.MSG_GAMEPAD_ATTACH:
+            read = gamepad.read_attach(message)
+            if read is None:
+                return
+            with self._lock:
+                if self._owner is not link:
+                    return
+                self._pad_attach_locked(link, read["pad"], read["kind"])
+            return
+
+        read = gamepad.read_detach(message)
+        if read is None:
+            return
+        with self._lock:
+            if self._owner is not link:
+                return
+            self._pad_detach_locked(link, read["pad"])
+
+    def _pad_attach_locked(self, link: _Link, pad: int, kind: str) -> None:
+        injector = self._injector_module()
+        attach = getattr(injector, "gamepad_attach", None)
+        if attach is None:
+            return
+        if link.pads.get(pad) == kind:
+            return
+        if pad in link.pads:
+            # A different kind on the same index: the old target goes before the new one arrives.
+            self._pad_detach_locked(link, pad)
+        try:
+            if attach(pad, kind):
+                link.pads[pad] = kind
+                LOGGER.info("Plugged a virtual %s pad %d in for %s", kind, pad, link.name)
+            else:
+                LOGGER.warning("A virtual %s pad for %s could not be plugged in", kind, link.name)
+                self._input_error_status(link)
+        except Exception:
+            LOGGER.exception("A virtual pad for %s could not be plugged in", link.name)
+            self._input_error_status(link)
+
+    def _pad_detach_locked(self, link: _Link, pad: int) -> None:
+        injector = self._injector_module()
+        detach = getattr(injector, "gamepad_detach", None)
+        if detach is None or pad not in link.pads:
+            link.pads.pop(pad, None)
+            return
+        try:
+            detach(pad)
+        except Exception:
+            LOGGER.exception("A virtual pad for %s could not be unplugged", link.name)
+        finally:
+            link.pads.pop(pad, None)
+
+    def _pad_report_locked(self, link: _Link, read: dict) -> None:
+        injector = self._injector_module()
+        report = getattr(injector, "gamepad_report", None)
+        if report is None:
+            return
+        pad = read["pad"]
+        if pad not in link.pads:
+            # A report before its attach, which a reconnect can produce: plug the default kind in
+            # rather than drop the frame, so a pad already being held works the moment it arrives.
+            self._pad_attach_locked(link, pad, gamepad.KIND_X360)
+            if pad not in link.pads:
+                return
+        inject_at = time.monotonic()
+        report(pad, read["buttons"], read["lt"], read["rt"], read["lx"], read["ly"], read["rx"], read["ry"])
+        link.timing.add("pad_inject", time.monotonic() - inject_at)
+
+    def _release_pads_locked(self, link: _Link) -> None:
+        """Unplug every virtual pad this link has. A link lost mid-trigger must not leave the PC
+        holding it, which is the pad's version of the held-key rule in section 4."""
+        for pad in sorted(link.pads):
+            self._pad_detach_locked(link, pad)
+        link.pads.clear()
 
     def _apply_motion_path_locked(self, link, read, after):
         desktop = self._desktop_module()
@@ -1386,7 +1498,11 @@ class LinkResponder:
 
     def _release_locked(self, link: _Link) -> None:
         """Let go of every key and button injected for this owner (section 4, step 1), then the
-        injector's own record of what it holds, as the backstop."""
+        injector's own record of what it holds, as the backstop.
+
+        The virtual pads go too: `_serve` ends the ownership when a link closes, so unplugging
+        them here covers a let-go, a take by another machine and a dropped link alike."""
+        self._release_pads_locked(link)
         injector = self._injector_module()
         for (kind, name), us in reversed(list(link.held.items())):
             try:
