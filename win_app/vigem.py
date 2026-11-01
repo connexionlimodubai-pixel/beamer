@@ -18,10 +18,16 @@ import logging
 import os
 import sys
 import threading
+import time
 from ctypes import wintypes
 from pathlib import Path
 
 LOGGER = logging.getLogger("Beamer")
+
+# How long a failed search for the library is remembered. Without this, every report on a machine
+# with no driver would try four paths and log the same line again; with it permanent, a driver
+# installed while Beamer runs would not be found until a restart.
+RETRY_SECONDS = 30.0
 
 # ViGEm/Common.h. Success is a value, not zero, which is easy to get wrong.
 VIGEM_ERROR_NONE = 0x20000000
@@ -103,6 +109,7 @@ class _Bus:
         self._targets = {}                 # pad index: PVIGEM_TARGET
         self.dll_path = None
         self.error = None                  # why it is unavailable, for the status and the log
+        self._failed_at = None             # when the search last came up empty
 
     # --- loading ---
 
@@ -111,6 +118,8 @@ class _Bus:
             return self._dll
         if not sys.platform.startswith("win"):
             self.error = "virtual pads need Windows"
+            return None
+        if self._failed_at is not None and time.monotonic() - self._failed_at < RETRY_SECONDS:
             return None
         attempted = []
         for candidate in _candidate_paths():
@@ -122,11 +131,14 @@ class _Bus:
             self._declare(dll)
             self._dll = dll
             self.dll_path = str(candidate)
+            self._failed_at = None
             LOGGER.info("ViGEmClient loaded from %s", self.dll_path)
             return dll
         self.error = (f"{DLL_NAME} was not found. Install ViGEmBus and put the library beside the "
                       f"app, or set {DLL_ENV_VAR} to it.")
-        LOGGER.info("%s (looked in: %s)", self.error, ", ".join(attempted))
+        if self._failed_at is None:
+            LOGGER.info("%s (looked in: %s)", self.error, ", ".join(attempted))
+        self._failed_at = time.monotonic()
         return None
 
     @staticmethod
